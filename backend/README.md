@@ -56,6 +56,196 @@ API available at `http://127.0.0.1:8001`. Interactive docs at
 pytest tests\
 ```
 
+## Portfolio aggregation endpoints (v1)
+
+New stateless basket endpoints are available for early portfolio workflows:
+
+- `POST /portfolio/value` - value a manual basket and return position PV,
+  total PV, and groupings.
+- `POST /portfolio/scenario` - run the same basket under simple parallel
+  shocks and return base/shocked PV plus deltas.
+- `POST /portfolio/risk` - compute first-order finite-difference portfolio
+  sensitivities by position, instrument type, and asset class.
+- `POST /portfolio/scenario-compare` - run predefined or supplied named
+  scenarios and return side-by-side portfolio, grouped, and position deltas.
+
+Minimal `POST /portfolio/value` shape:
+
+```json
+{
+  "portfolio_name": "Demo Basket",
+  "valuation_date": "2024-01-01",
+  "positions": [
+    {
+      "position_id": "fxfwd-1",
+      "instrument_type": "fx_forward",
+      "quantity": 1.0,
+      "fields": {
+        "maturity_date": "2024-07-01",
+        "notional_foreign": 1000000,
+        "spot_rate": 18.25,
+        "contract_forward_rate": 18.60,
+        "domestic_rate": 0.08,
+        "foreign_rate": 0.05,
+        "domestic_currency": "ZAR",
+        "foreign_currency": "USD",
+        "day_count": "ACT_365F",
+        "position": "long_foreign"
+      }
+    }
+  ]
+}
+```
+
+For scenarios, add:
+
+```json
+"shocks": {
+  "rates_bps": 25,
+  "fx_spot_pct": 2.0,
+  "equity_spot_pct": -3.0,
+  "vol_pct": 10.0
+}
+```
+
+Contract notes for manual proof:
+
+- Position payloads must use `fields` for instrument-specific inputs.
+- Scenario payloads must use `shocks` (not `scenario`).
+- Route paths are `POST /portfolio/value`, `POST /portfolio/scenario`,
+  `POST /portfolio/risk`, and `POST /portfolio/scenario-compare`.
+- Portfolio risk conventions are explicit: rates sensitivity is PV change for
+  a parallel +1bp move; FX spot and equity spot sensitivities are PV changes
+  for +1% spot moves; volatility sensitivity is PV change for +1 vol point
+  (`volatility + 0.01`).
+- The default scenario pack is `Core Market Moves`: Rates Up/Down (+/-100bp),
+  FX Up/Down (+/-5%), Equity Up/Down (+/-5%), Vol Up (+5%), and Combined
+  Stress (rates +100bp, FX +5%, equity -5%, vol +5%).
+
+### Live proof — portfolio base value
+
+Run the backend first on the canonical local port:
+
+```powershell
+cd backend
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8001
+```
+
+Then run:
+
+```powershell
+$body = @{
+  portfolio_name = "demo_book"
+  valuation_date = "2026-03-26"
+  positions = @(
+    @{
+      position_id = "fxfwd_1"
+      instrument_type = "fx_forward"
+      fields = @{
+        valuation_date        = "2026-03-26"
+        maturity_date         = "2026-09-26"
+        spot_rate             = 18.25
+        domestic_rate         = 0.082
+        foreign_rate          = 0.051
+        notional_foreign      = 1000000
+        contract_forward_rate = 18.40
+        position              = "long_foreign"
+        domestic_currency     = "ZAR"
+        foreign_currency      = "USD"
+        day_count             = "ACT_365F"
+      }
+    },
+    @{
+      position_id = "eqopt_1"
+      instrument_type = "equity_option"
+      fields = @{
+        valuation_date  = "2026-03-26"
+        expiry_date     = "2026-09-26"
+        spot_price      = 100.0
+        strike_price    = 105.0
+        risk_free_rate  = 0.08
+        dividend_yield  = 0.02
+        volatility      = 0.25
+        quantity_shares = 1000
+        option_type     = "call"
+        position        = "long"
+        underlying_name = "TEST_EQ"
+        currency        = "ZAR"
+        day_count       = "ACT_365F"
+      }
+    }
+  )
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod \
+  -Uri "http://127.0.0.1:8001/portfolio/value" \
+  -Method Post \
+  -ContentType "application/json" \
+  -Body $body
+```
+
+### Live proof — portfolio scenario
+
+```powershell
+$body = @{
+  portfolio_name = "demo_book"
+  valuation_date = "2026-03-26"
+  shocks = @{
+    rates_bps = 50
+    fx_spot_pct = 2.0
+    equity_spot_pct = 3.0
+    vol_pct = 5.0
+  }
+  positions = @(
+    @{
+      position_id = "fxfwd_1"
+      instrument_type = "fx_forward"
+      fields = @{
+        valuation_date        = "2026-03-26"
+        maturity_date         = "2026-09-26"
+        spot_rate             = 18.25
+        domestic_rate         = 0.082
+        foreign_rate          = 0.051
+        notional_foreign      = 1000000
+        contract_forward_rate = 18.40
+        position              = "long_foreign"
+        domestic_currency     = "ZAR"
+        foreign_currency      = "USD"
+        day_count             = "ACT_365F"
+      }
+    },
+    @{
+      position_id = "eqopt_1"
+      instrument_type = "equity_option"
+      fields = @{
+        valuation_date  = "2026-03-26"
+        expiry_date     = "2026-09-26"
+        spot_price      = 100.0
+        strike_price    = 105.0
+        risk_free_rate  = 0.08
+        dividend_yield  = 0.02
+        volatility      = 0.25
+        quantity_shares = 1000
+        option_type     = "call"
+        position        = "long"
+        underlying_name = "TEST_EQ"
+        currency        = "ZAR"
+        day_count       = "ACT_365F"
+      }
+    }
+  )
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod \
+  -Uri "http://127.0.0.1:8001/portfolio/scenario" \
+  -Method Post \
+  -ContentType "application/json" \
+  -Body $body
+```
+
+Use `http://127.0.0.1:8001` for local live proof in this workspace unless you
+intentionally changed the backend port.
+
 ## FX Forward route proof
 
 `POST /price/fx-forward` expects the backend schema field

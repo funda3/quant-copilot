@@ -16,6 +16,10 @@ configured by BACKEND:
     POST /price/bond      — deterministic fixed-rate bond pricing
     POST /risk/bond       — bond DV01 and modified duration
     POST /price/bond/ytm  — flat YTM solver from market dirty price
+    POST /portfolio/value — portfolio basket valuation and aggregation
+    POST /portfolio/scenario — portfolio shocked revaluation and delta report
+    POST /portfolio/risk — portfolio finite-difference risk decomposition
+    POST /portfolio/scenario-compare — predefined scenario pack comparison
 
 Pages (sidebar navigation):
   IRS Pricing       — NLP prompt → extract → price IRS (quote endpoint)
@@ -28,11 +32,16 @@ Pages (sidebar navigation):
   Curve Builder     — build and inspect a bootstrapped discount curve
   Risk Ladder       — bucketed key-rate PV01 for an IRS
   Scenario Analysis — parallel curve-shift NPV table for an IRS
+    Portfolio / Scenario — basket valuation and simple scenario shocks
   Bond Pricing      — DCF pricing + DV01/modified duration + YTM solver for a fixed-rate bond
 """
 
 from __future__ import annotations
 
+import csv
+import json
+from datetime import date
+from io import StringIO
 import re
 
 import requests
@@ -56,6 +65,997 @@ _DEFAULT_FRAS = """6x9 0.081
 _DEFAULT_SWAPS = """2Y 0.082
 3Y 0.083
 5Y 0.085"""
+
+_DEFAULT_PORTFOLIO_POSITIONS = [
+    {
+        "position_id": "bond-1",
+        "instrument_type": "bond",
+        "quantity": 1.0,
+        "fields": {
+            "issue_date": "2024-01-01",
+            "maturity_date": "2029-01-01",
+            "face_value": 1000000.0,
+            "coupon_rate": 0.08,
+            "coupon_frequency": "annual",
+            "day_count": "ACT_365F",
+        },
+    },
+    {
+        "position_id": "fra-1",
+        "instrument_type": "fra",
+        "quantity": 1.0,
+        "fields": {
+            "start_date": "2024-07-01",
+            "end_date": "2025-01-01",
+            "notional": 1000000.0,
+            "contract_rate": 0.08,
+            "day_count": "ACT_365F",
+            "position": "payer",
+        },
+    },
+    {
+        "position_id": "fxfwd-1",
+        "instrument_type": "fx_forward",
+        "quantity": 1.0,
+        "fields": {
+            "maturity_date": "2024-07-01",
+            "notional_foreign": 1000000.0,
+            "spot_rate": 18.25,
+            "contract_forward_rate": 18.6,
+            "domestic_rate": 0.08,
+            "foreign_rate": 0.05,
+            "domestic_currency": "ZAR",
+            "foreign_currency": "USD",
+            "day_count": "ACT_365F",
+            "position": "long_foreign",
+        },
+    },
+    {
+        "position_id": "fxswap-1",
+        "instrument_type": "fx_swap",
+        "quantity": 1.0,
+        "fields": {
+            "near_settlement_date": "2024-01-03",
+            "far_settlement_date": "2024-07-01",
+            "spot_rate": 18.25,
+            "near_rate": 18.27,
+            "far_rate": 18.65,
+            "notional_foreign": 1000000.0,
+            "domestic_currency": "ZAR",
+            "foreign_currency": "USD",
+            "domestic_rate": 0.08,
+            "day_count": "ACT_365F",
+            "position": "long_foreign",
+        },
+    },
+    {
+        "position_id": "fxopt-1",
+        "instrument_type": "fx_option",
+        "quantity": 1.0,
+        "fields": {
+            "expiry_date": "2024-07-01",
+            "settlement_date": "2024-07-01",
+            "spot_rate": 18.25,
+            "strike_rate": 18.4,
+            "domestic_rate": 0.08,
+            "foreign_rate": 0.05,
+            "volatility": 0.18,
+            "notional_foreign": 1000000.0,
+            "option_type": "call",
+            "position": "long",
+            "domestic_currency": "ZAR",
+            "foreign_currency": "USD",
+            "day_count": "ACT_365F",
+        },
+    },
+    {
+        "position_id": "eqopt-1",
+        "instrument_type": "equity_option",
+        "quantity": 1.0,
+        "fields": {
+            "expiry_date": "2024-07-01",
+            "spot_price": 100.0,
+            "strike_price": 105.0,
+            "risk_free_rate": 0.05,
+            "dividend_yield": 0.02,
+            "volatility": 0.25,
+            "quantity_shares": 1000.0,
+            "option_type": "call",
+            "position": "long",
+            "currency": "USD",
+            "day_count": "ACT_365F",
+            "underlying_name": "ACME",
+        },
+    },
+]
+
+_DEFAULT_PORTFOLIO_POSITIONS_JSON = json.dumps(_DEFAULT_PORTFOLIO_POSITIONS, indent=2)
+_DEFAULT_PORTFOLIO_SHOCKS_JSON = json.dumps(
+    {
+        "rates_bps": 25,
+        "fx_spot_pct": 2.0,
+        "equity_spot_pct": -3.0,
+        "vol_pct": 10.0,
+    },
+    indent=2,
+)
+
+_DEFAULT_SCENARIO_PACK = "Core Market Moves"
+_SCENARIO_PACK_OPTIONS = [_DEFAULT_SCENARIO_PACK]
+_SCENARIO_PACK_CONVENTIONS = {
+    "Rates Up": "Parallel +100bp rate shock.",
+    "Rates Down": "Parallel -100bp rate shock.",
+    "FX Up": "FX spot +5%.",
+    "FX Down": "FX spot -5%.",
+    "Equity Up": "Equity spot +5%.",
+    "Equity Down": "Equity spot -5%.",
+    "Vol Up": "Volatility +5%.",
+    "Combined Stress": "Rates +100bp, FX spot +5%, equity spot -5%, volatility +5%.",
+}
+
+_DEFAULT_PORTFOLIO_CSV_TEXT = """position_id,instrument_type,quantity,asset_class,maturity_date,notional_foreign,spot_rate,contract_forward_rate,domestic_rate,foreign_rate,domestic_currency,foreign_currency,day_count,position,expiry_date,spot_price,strike_price,risk_free_rate,dividend_yield,volatility,quantity_shares,option_type,currency,underlying_name
+fxfwd_1,fx_forward,1,fx,2026-09-26,1000000,18.25,18.40,0.082,0.051,ZAR,USD,ACT_365F,long_foreign,,,,,,,,,,
+eqopt_1,equity_option,1,equity,,,,,,,,,,2026-09-26,100,105,0.08,0.02,0.25,1000,call,ZAR,TEST_EQ
+"""
+
+_PORTFOLIO_SUPPORTED_INSTRUMENTS: set[str] = {
+    "bond",
+    "fra",
+    "fx_forward",
+    "fx_swap",
+    "fx_option",
+    "equity_option",
+}
+
+_PORTFOLIO_REQUIRED_FIELDS: dict[str, set[str]] = {
+    "bond": {
+        "issue_date",
+        "maturity_date",
+        "face_value",
+        "coupon_rate",
+        "coupon_frequency",
+        "day_count",
+    },
+    "fra": {
+        "start_date",
+        "end_date",
+        "notional",
+        "contract_rate",
+        "day_count",
+        "position",
+    },
+    "fx_forward": {
+        "maturity_date",
+        "notional_foreign",
+        "spot_rate",
+        "contract_forward_rate",
+        "domestic_rate",
+        "foreign_rate",
+        "domestic_currency",
+        "foreign_currency",
+        "day_count",
+        "position",
+    },
+    "fx_swap": {
+        "near_settlement_date",
+        "far_settlement_date",
+        "spot_rate",
+        "near_rate",
+        "far_rate",
+        "notional_foreign",
+        "domestic_currency",
+        "foreign_currency",
+        "domestic_rate",
+        "day_count",
+        "position",
+    },
+    "fx_option": {
+        "expiry_date",
+        "spot_rate",
+        "strike_rate",
+        "domestic_rate",
+        "foreign_rate",
+        "volatility",
+        "notional_foreign",
+        "option_type",
+        "position",
+        "domestic_currency",
+        "foreign_currency",
+        "day_count",
+    },
+    "equity_option": {
+        "expiry_date",
+        "spot_price",
+        "strike_price",
+        "risk_free_rate",
+        "dividend_yield",
+        "volatility",
+        "quantity_shares",
+        "option_type",
+        "position",
+        "currency",
+        "day_count",
+    },
+}
+
+_PORTFOLIO_OPTIONAL_FIELDS: dict[str, set[str]] = {
+    "bond": {"valuation_date", "curve_inputs"},
+    "fra": {"valuation_date", "curve_inputs"},
+    "fx_forward": {"valuation_date"},
+    "fx_swap": {"valuation_date"},
+    "fx_option": {"valuation_date", "settlement_date"},
+    "equity_option": {"valuation_date", "underlying_name"},
+}
+
+_PORTFOLIO_NUMERIC_FIELDS: set[str] = {
+    "face_value",
+    "coupon_rate",
+    "notional",
+    "contract_rate",
+    "notional_foreign",
+    "spot_rate",
+    "contract_forward_rate",
+    "domestic_rate",
+    "foreign_rate",
+    "near_rate",
+    "far_rate",
+    "strike_rate",
+    "volatility",
+    "spot_price",
+    "strike_price",
+    "risk_free_rate",
+    "dividend_yield",
+    "quantity_shares",
+}
+
+_PORTFOLIO_DATE_FIELDS: set[str] = {
+    "valuation_date",
+    "issue_date",
+    "maturity_date",
+    "start_date",
+    "end_date",
+    "near_settlement_date",
+    "far_settlement_date",
+    "expiry_date",
+    "settlement_date",
+}
+
+
+def _coerce_portfolio_field(field_name: str, value: object) -> object:
+    if field_name in _PORTFOLIO_NUMERIC_FIELDS:
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Field '{field_name}' must be numeric; got {value!r}.") from exc
+
+    if field_name in _PORTFOLIO_DATE_FIELDS:
+        text = str(value).strip()
+        try:
+            date.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Field '{field_name}' must be ISO date YYYY-MM-DD; got {value!r}."
+            ) from exc
+        return text
+
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _normalise_positions_and_collect_errors(raw_positions: list[dict]) -> tuple[list[dict], list[dict]]:
+    normalised: list[dict] = []
+    errors: list[dict] = []
+
+    for idx, position in enumerate(raw_positions, start=1):
+        position_id = str(position.get("position_id") or f"row-{idx}")
+        instrument_type = str(position.get("instrument_type") or "").strip().lower()
+        row_errors: list[str] = []
+
+        if instrument_type not in _PORTFOLIO_SUPPORTED_INSTRUMENTS:
+            row_errors.append(
+                f"Unsupported instrument_type '{instrument_type or 'missing'}'."
+            )
+
+        quantity_raw = position.get("quantity", 1.0)
+        try:
+            quantity = float(quantity_raw)
+            if quantity <= 0.0:
+                raise ValueError("quantity must be > 0")
+        except (TypeError, ValueError):
+            row_errors.append(f"Invalid quantity '{quantity_raw}'. Expected a positive number.")
+            quantity = 0.0
+
+        fields_obj = position.get("fields")
+        if not isinstance(fields_obj, dict):
+            row_errors.append("Missing or invalid 'fields' object.")
+            fields_obj = {}
+
+        normalised_fields: dict = {}
+        if instrument_type in _PORTFOLIO_SUPPORTED_INSTRUMENTS:
+            required_fields = _PORTFOLIO_REQUIRED_FIELDS[instrument_type]
+            optional_fields = _PORTFOLIO_OPTIONAL_FIELDS[instrument_type]
+
+            for field_name in required_fields:
+                if field_name not in fields_obj or fields_obj.get(field_name) in (None, ""):
+                    row_errors.append(f"Missing required field '{field_name}'.")
+                    continue
+                try:
+                    normalised_fields[field_name] = _coerce_portfolio_field(
+                        field_name,
+                        fields_obj[field_name],
+                    )
+                except ValueError as exc:
+                    row_errors.append(str(exc))
+
+            for field_name in optional_fields:
+                if field_name not in fields_obj or fields_obj.get(field_name) in (None, ""):
+                    continue
+                try:
+                    normalised_fields[field_name] = _coerce_portfolio_field(
+                        field_name,
+                        fields_obj[field_name],
+                    )
+                except ValueError as exc:
+                    row_errors.append(str(exc))
+
+            if "curve_inputs" in fields_obj and fields_obj.get("curve_inputs") not in (None, ""):
+                if isinstance(fields_obj["curve_inputs"], dict):
+                    normalised_fields["curve_inputs"] = fields_obj["curve_inputs"]
+                else:
+                    row_errors.append("Optional field 'curve_inputs' must be an object.")
+
+        if row_errors:
+            for msg in row_errors:
+                errors.append(
+                    {
+                        "row": idx,
+                        "position_id": position_id,
+                        "instrument_type": instrument_type or "missing",
+                        "error": msg,
+                    }
+                )
+            continue
+
+        normalised_row: dict = {
+            "position_id": position_id,
+            "instrument_type": instrument_type,
+            "quantity": quantity,
+            "fields": normalised_fields,
+        }
+        asset_class = str(position.get("asset_class") or "").strip()
+        if asset_class:
+            normalised_row["asset_class"] = asset_class
+        normalised.append(normalised_row)
+
+    return normalised, errors
+
+
+def _parse_delimited_positions_text(text: str) -> tuple[list[dict], list[dict]]:
+    clean_text = text.strip()
+    if not clean_text:
+        return [], [{"row": 0, "position_id": "—", "instrument_type": "—", "error": "Input text is empty."}]
+
+    sample = clean_text[:4096]
+    delimiter = ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        delimiter = ","
+
+    reader = csv.DictReader(StringIO(clean_text), delimiter=delimiter)
+    if not reader.fieldnames:
+        return [], [{"row": 0, "position_id": "—", "instrument_type": "—", "error": "Could not detect a header row."}]
+
+    if "instrument_type" not in reader.fieldnames:
+        return [], [{"row": 0, "position_id": "—", "instrument_type": "—", "error": "Header must include instrument_type."}]
+
+    raw_positions: list[dict] = []
+    for idx, row in enumerate(reader, start=1):
+        if not any((str(v).strip() for v in row.values() if v is not None)):
+            continue
+
+        instrument_type = str(row.get("instrument_type") or "").strip().lower()
+        required = _PORTFOLIO_REQUIRED_FIELDS.get(instrument_type, set())
+        optional = _PORTFOLIO_OPTIONAL_FIELDS.get(instrument_type, set())
+
+        fields: dict = {}
+        for field_name in required.union(optional):
+            value = row.get(field_name)
+            if value is None:
+                continue
+            stripped = str(value).strip()
+            if stripped != "":
+                fields[field_name] = stripped
+
+        curve_inputs_json = row.get("curve_inputs_json")
+        if curve_inputs_json and str(curve_inputs_json).strip():
+            try:
+                fields["curve_inputs"] = json.loads(str(curve_inputs_json).strip())
+            except json.JSONDecodeError:
+                fields["curve_inputs"] = "__INVALID_CURVE_INPUTS_JSON__"
+
+        raw_positions.append(
+            {
+                "position_id": str(row.get("position_id") or f"row-{idx}").strip(),
+                "instrument_type": instrument_type,
+                "quantity": str(row.get("quantity") or "1").strip(),
+                "asset_class": str(row.get("asset_class") or "").strip(),
+                "fields": fields,
+            }
+        )
+
+    if not raw_positions:
+        return [], [{"row": 0, "position_id": "—", "instrument_type": "—", "error": "No data rows detected."}]
+
+    return _normalise_positions_and_collect_errors(raw_positions)
+
+
+def _format_portfolio_import_errors_md(errors: list[dict]) -> str:
+    header = "| Row | Position ID | Instrument | Error |\n|---:|---|---|---|\n"
+    body = "".join(
+        f"| {e.get('row', '—')} | {e.get('position_id', '—')} | {e.get('instrument_type', '—')} | {e.get('error', '—')} |\n"
+        for e in errors
+    )
+    return header + body
+
+
+def _value_result_csv_summary(data: dict) -> str:
+    output = StringIO()
+    fieldnames = [
+        "portfolio_name",
+        "valuation_date",
+        "request_id",
+        "status",
+        "position_count",
+        "valued_count",
+        "unsupported_count",
+        "total_portfolio_pv",
+        "grouped_pv_by_instrument_type",
+        "grouped_pv_by_asset_class",
+        "position_id",
+        "instrument_type",
+        "asset_class",
+        "quantity",
+        "position_status",
+        "pricing_status",
+        "pv",
+        "position_warnings",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    meta = {
+        "portfolio_name": data.get("portfolio_name", ""),
+        "valuation_date": data.get("valuation_date", ""),
+        "request_id": data.get("request_id", ""),
+        "status": data.get("status", ""),
+        "position_count": data.get("position_count", 0),
+        "valued_count": data.get("valued_count", 0),
+        "unsupported_count": data.get("unsupported_count", 0),
+        "total_portfolio_pv": data.get("total_portfolio_pv", 0.0),
+        "grouped_pv_by_instrument_type": json.dumps(data.get("grouped_pv_by_instrument_type", {}), sort_keys=True),
+        "grouped_pv_by_asset_class": json.dumps(data.get("grouped_pv_by_asset_class", {}), sort_keys=True),
+    }
+
+    positions = data.get("positions", [])
+    if not positions:
+        writer.writerow(meta)
+    else:
+        for row in positions:
+            writer.writerow(
+                {
+                    **meta,
+                    "position_id": row.get("position_id", ""),
+                    "instrument_type": row.get("instrument_type", ""),
+                    "asset_class": row.get("asset_class", ""),
+                    "quantity": row.get("quantity", ""),
+                    "position_status": row.get("status", ""),
+                    "pricing_status": row.get("pricing_status", ""),
+                    "pv": row.get("pv", 0.0),
+                    "position_warnings": "; ".join(row.get("warnings", []) or []),
+                }
+            )
+    return output.getvalue()
+
+
+def _scenario_result_csv_summary(data: dict) -> str:
+    output = StringIO()
+    fieldnames = [
+        "portfolio_name",
+        "valuation_date",
+        "request_id",
+        "status",
+        "position_count",
+        "valued_count",
+        "unsupported_count",
+        "base_portfolio_pv",
+        "shocked_portfolio_pv",
+        "delta_portfolio_pv",
+        "grouped_base_pv_by_instrument_type",
+        "grouped_shocked_pv_by_instrument_type",
+        "grouped_delta_pv_by_instrument_type",
+        "grouped_delta_pv_by_asset_class",
+        "position_id",
+        "instrument_type",
+        "asset_class",
+        "quantity",
+        "position_status",
+        "base_pricing_status",
+        "shocked_pricing_status",
+        "base_pv",
+        "shocked_pv",
+        "delta_pv",
+        "position_warnings",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    meta = {
+        "portfolio_name": data.get("portfolio_name", ""),
+        "valuation_date": data.get("valuation_date", ""),
+        "request_id": data.get("request_id", ""),
+        "status": data.get("status", ""),
+        "position_count": data.get("position_count", 0),
+        "valued_count": data.get("valued_count", 0),
+        "unsupported_count": data.get("unsupported_count", 0),
+        "base_portfolio_pv": data.get("base_portfolio_pv", 0.0),
+        "shocked_portfolio_pv": data.get("shocked_portfolio_pv", 0.0),
+        "delta_portfolio_pv": data.get("delta_portfolio_pv", 0.0),
+        "grouped_base_pv_by_instrument_type": json.dumps(data.get("grouped_base_pv_by_instrument_type", {}), sort_keys=True),
+        "grouped_shocked_pv_by_instrument_type": json.dumps(data.get("grouped_shocked_pv_by_instrument_type", {}), sort_keys=True),
+        "grouped_delta_pv_by_instrument_type": json.dumps(data.get("grouped_delta_pv_by_instrument_type", {}), sort_keys=True),
+        "grouped_delta_pv_by_asset_class": json.dumps(data.get("grouped_delta_pv_by_asset_class", {}), sort_keys=True),
+    }
+
+    positions = data.get("positions", [])
+    if not positions:
+        writer.writerow(meta)
+    else:
+        for row in positions:
+            writer.writerow(
+                {
+                    **meta,
+                    "position_id": row.get("position_id", ""),
+                    "instrument_type": row.get("instrument_type", ""),
+                    "asset_class": row.get("asset_class", ""),
+                    "quantity": row.get("quantity", ""),
+                    "position_status": row.get("status", ""),
+                    "base_pricing_status": row.get("base_pricing_status", ""),
+                    "shocked_pricing_status": row.get("shocked_pricing_status", ""),
+                    "base_pv": row.get("base_pv", 0.0),
+                    "shocked_pv": row.get("shocked_pv", 0.0),
+                    "delta_pv": row.get("delta_pv", 0.0),
+                    "position_warnings": "; ".join(row.get("warnings", []) or []),
+                }
+            )
+    return output.getvalue()
+
+
+def _scenario_compare_csv_summary(data: dict) -> str:
+    output = StringIO()
+    fieldnames = [
+        "portfolio_name",
+        "valuation_date",
+        "request_id",
+        "status",
+        "scenario_pack",
+        "scenario_name",
+        "description",
+        "shocks",
+        "scenario_status",
+        "base_portfolio_pv",
+        "shocked_portfolio_pv",
+        "delta_portfolio_pv",
+        "valued_count",
+        "unsupported_count",
+        "largest_contributor",
+        "largest_contributor_delta_pv",
+        "largest_loser",
+        "largest_loser_delta_pv",
+        "scenario_warnings",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    meta = {
+        "portfolio_name": data.get("portfolio_name", ""),
+        "valuation_date": data.get("valuation_date", ""),
+        "request_id": data.get("request_id", ""),
+        "status": data.get("status", ""),
+        "scenario_pack": data.get("scenario_pack", ""),
+    }
+    for row in data.get("scenarios", []) or []:
+        writer.writerow(
+            {
+                **meta,
+                "scenario_name": row.get("scenario_name", ""),
+                "description": row.get("description", ""),
+                "shocks": json.dumps(row.get("shocks", {}), sort_keys=True),
+                "scenario_status": row.get("status", ""),
+                "base_portfolio_pv": row.get("base_portfolio_pv", 0.0),
+                "shocked_portfolio_pv": row.get("shocked_portfolio_pv", 0.0),
+                "delta_portfolio_pv": row.get("delta_portfolio_pv", 0.0),
+                "valued_count": row.get("valued_count", 0),
+                "unsupported_count": row.get("unsupported_count", 0),
+                "largest_contributor": row.get("largest_contributor", ""),
+                "largest_contributor_delta_pv": row.get("largest_contributor_delta_pv", 0.0),
+                "largest_loser": row.get("largest_loser", ""),
+                "largest_loser_delta_pv": row.get("largest_loser_delta_pv", 0.0),
+                "scenario_warnings": "; ".join(row.get("warnings", []) or []),
+            }
+        )
+    return output.getvalue()
+
+
+def _scenario_compare_position_csv(data: dict) -> str:
+    scenario_names = [row.get("scenario_name", "") for row in data.get("scenarios", []) or []]
+    output = StringIO()
+    fieldnames = [
+        "portfolio_name",
+        "valuation_date",
+        "position_id",
+        "instrument_type",
+        "asset_class",
+        *scenario_names,
+        "warnings_by_scenario",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for row in data.get("positions", []) or []:
+        deltas = row.get("deltas_by_scenario", {}) or {}
+        writer.writerow(
+            {
+                "portfolio_name": data.get("portfolio_name", ""),
+                "valuation_date": data.get("valuation_date", ""),
+                "position_id": row.get("position_id", ""),
+                "instrument_type": row.get("instrument_type", ""),
+                "asset_class": row.get("asset_class", ""),
+                **{name: deltas.get(name, 0.0) for name in scenario_names},
+                "warnings_by_scenario": json.dumps(row.get("warnings_by_scenario", {}), sort_keys=True),
+            }
+        )
+    return output.getvalue()
+
+
+def _risk_result_csv_summary(data: dict) -> str:
+    output = StringIO()
+    sensitivity_keys = [
+        "rates_sensitivity",
+        "fx_spot_sensitivity",
+        "equity_spot_sensitivity",
+        "vol_sensitivity",
+    ]
+    fieldnames = [
+        "portfolio_name",
+        "valuation_date",
+        "request_id",
+        "status",
+        "position_count",
+        "valued_count",
+        "unsupported_count",
+        "total_portfolio_pv",
+        "sensitivity_conventions",
+        "grouped_sensitivities_by_instrument_type",
+        "grouped_sensitivities_by_asset_class",
+        *[f"total_{key}" for key in sensitivity_keys],
+        "position_id",
+        "instrument_type",
+        "asset_class",
+        "quantity",
+        "position_status",
+        "base_pricing_status",
+        "base_pv",
+        *sensitivity_keys,
+        "position_warnings",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    totals = data.get("total_sensitivities", {}) or {}
+    meta = {
+        "portfolio_name": data.get("portfolio_name", ""),
+        "valuation_date": data.get("valuation_date", ""),
+        "request_id": data.get("request_id", ""),
+        "status": data.get("status", ""),
+        "position_count": data.get("position_count", 0),
+        "valued_count": data.get("valued_count", 0),
+        "unsupported_count": data.get("unsupported_count", 0),
+        "total_portfolio_pv": data.get("total_portfolio_pv", 0.0),
+        "sensitivity_conventions": json.dumps(data.get("sensitivity_conventions", {}), sort_keys=True),
+        "grouped_sensitivities_by_instrument_type": json.dumps(data.get("grouped_sensitivities_by_instrument_type", {}), sort_keys=True),
+        "grouped_sensitivities_by_asset_class": json.dumps(data.get("grouped_sensitivities_by_asset_class", {}), sort_keys=True),
+        **{f"total_{key}": totals.get(key, 0.0) for key in sensitivity_keys},
+    }
+
+    positions = data.get("positions", []) or []
+    if not positions:
+        writer.writerow(meta)
+    else:
+        for row in positions:
+            writer.writerow(
+                {
+                    **meta,
+                    "position_id": row.get("position_id", ""),
+                    "instrument_type": row.get("instrument_type", ""),
+                    "asset_class": row.get("asset_class", ""),
+                    "quantity": row.get("quantity", ""),
+                    "position_status": row.get("status", ""),
+                    "base_pricing_status": row.get("base_pricing_status", ""),
+                    "base_pv": row.get("base_pv", 0.0),
+                    **{key: row.get(key, 0.0) for key in sensitivity_keys},
+                    "position_warnings": "; ".join(row.get("warnings", []) or []),
+                }
+            )
+    return output.getvalue()
+
+
+def _portfolio_ranked_rows(rows: list[dict], value_key: str, reverse: bool = True, limit: int = 5) -> list[dict]:
+    return sorted(
+        rows,
+        key=lambda row: float(row.get(value_key, 0.0) or 0.0),
+        reverse=reverse,
+    )[:limit]
+
+
+def _portfolio_warning_summary(data: dict) -> dict:
+    positions = data.get("positions", []) or []
+    row_warnings = [
+        warning
+        for row in positions
+        for warning in (row.get("warnings", []) or [])
+    ]
+    top_level_warnings = data.get("warnings", []) or []
+    all_warnings = top_level_warnings + row_warnings
+    ignored_shocks = [
+        warning
+        for warning in all_warnings
+        if "ignored" in warning.lower() or "did not modify" in warning.lower()
+    ]
+    unsupported_rows = [
+        row
+        for row in positions
+        if row.get("status") == "unsupported"
+        or row.get("base_pricing_status") in {"unsupported", "validation_error", "error"}
+        or row.get("shocked_pricing_status") in {"unsupported", "validation_error", "error"}
+        or row.get("pricing_status") in {"unsupported", "validation_error", "error"}
+    ]
+    valuation_warnings = [
+        warning
+        for warning in all_warnings
+        if warning not in ignored_shocks
+    ]
+    return {
+        "ignored_shocks": ignored_shocks,
+        "unsupported_rows": unsupported_rows,
+        "valuation_warnings": valuation_warnings,
+    }
+
+
+def _format_warning_summary_md(summary: dict) -> str:
+    ignored_count = len(summary["ignored_shocks"])
+    unsupported_count = len(summary["unsupported_rows"])
+    valuation_count = len(summary["valuation_warnings"])
+    lines = [
+        "| Category | Count | Detail |",
+        "|---|---:|---|",
+        f"| Ignored shocks | {ignored_count} | {'; '.join(summary['ignored_shocks']) if ignored_count else 'None'} |",
+        f"| Unsupported rows | {unsupported_count} | {', '.join(row.get('position_id', 'unknown') for row in summary['unsupported_rows']) if unsupported_count else 'None'} |",
+        f"| Valuation warnings | {valuation_count} | {'; '.join(summary['valuation_warnings']) if valuation_count else 'None'} |",
+    ]
+    return "\n".join(lines)
+
+
+def _scenario_interpretation_lines(data: dict) -> list[str]:
+    rows = data.get("positions", []) or []
+    valued_rows = [row for row in rows if row.get("status") == "valued"]
+    lines: list[str] = []
+
+    total_delta = float(data.get("delta_portfolio_pv", 0.0) or 0.0)
+    if total_delta > 0:
+        lines.append(f"Scenario increased portfolio PV by {total_delta:+,.2f}.")
+    elif total_delta < 0:
+        lines.append(f"Scenario decreased portfolio PV by {total_delta:+,.2f}.")
+    else:
+        lines.append("Scenario left total portfolio PV unchanged.")
+
+    positive = [row for row in valued_rows if float(row.get("delta_pv", 0.0) or 0.0) > 0.0]
+    negative = [row for row in valued_rows if float(row.get("delta_pv", 0.0) or 0.0) < 0.0]
+    if positive:
+        top = max(positive, key=lambda row: float(row.get("delta_pv", 0.0) or 0.0))
+        lines.append(
+            f"Biggest positive contributor was {top.get('position_id', 'unknown')} at {float(top.get('delta_pv', 0.0) or 0.0):+,.2f}."
+        )
+    if negative:
+        bottom = min(negative, key=lambda row: float(row.get("delta_pv", 0.0) or 0.0))
+        lines.append(
+            f"Biggest negative contributor was {bottom.get('position_id', 'unknown')} at {float(bottom.get('delta_pv', 0.0) or 0.0):+,.2f}."
+        )
+
+    by_asset = data.get("grouped_delta_pv_by_asset_class", {}) or {}
+    total_abs_asset_delta = sum(abs(float(value or 0.0)) for value in by_asset.values())
+    if total_abs_asset_delta > 0.0:
+        top_asset, top_delta = max(
+            by_asset.items(),
+            key=lambda item: abs(float(item[1] or 0.0)),
+        )
+        share = abs(float(top_delta or 0.0)) / total_abs_asset_delta
+        if share >= 0.5:
+            lines.append(
+                f"Asset-class delta is concentrated in {top_asset}, contributing {share:.0%} of absolute grouped delta."
+            )
+
+    unchanged_ignored = [
+        row
+        for row in rows
+        if abs(float(row.get("delta_pv", 0.0) or 0.0)) < 1e-9
+        and any(
+            "ignored" in warning.lower() or "did not modify" in warning.lower()
+            for warning in (row.get("warnings", []) or [])
+        )
+    ]
+    if unchanged_ignored:
+        lines.append(
+            f"{len(unchanged_ignored)} position(s) were unchanged because one or more shocks were ignored."
+        )
+
+    return lines
+
+
+def _format_scenario_contributor_table(rows: list[dict]) -> str:
+    body = "".join(
+        f"| {idx}"
+        f" | {row.get('position_id', 'â€”')}"
+        f" | {row.get('instrument_type', 'â€”')}"
+        f" | {row.get('asset_class', 'â€”')}"
+        f" | {float(row.get('delta_pv', 0.0) or 0.0):+,.2f} |\n"
+        for idx, row in enumerate(rows, start=1)
+    )
+    return "| Rank | Position ID | Instrument | Asset Class | Delta PV |\n|---:|---|---|---|---:|\n" + body
+
+
+def _format_scenario_compare_summary_table(rows: list[dict]) -> str:
+    body = "".join(
+        f"| {row.get('scenario_name', '-')}"
+        f" | {row.get('description', '-')}"
+        f" | {row.get('status', '-')}"
+        f" | {float(row.get('base_portfolio_pv', 0.0) or 0.0):,.2f}"
+        f" | {float(row.get('shocked_portfolio_pv', 0.0) or 0.0):,.2f}"
+        f" | {float(row.get('delta_portfolio_pv', 0.0) or 0.0):+,.2f}"
+        f" | {row.get('largest_contributor') or '-'}"
+        f" | {float(row.get('largest_contributor_delta_pv', 0.0) or 0.0):+,.2f}"
+        f" | {row.get('largest_loser') or '-'}"
+        f" | {float(row.get('largest_loser_delta_pv', 0.0) or 0.0):+,.2f} |\n"
+        for row in rows
+    )
+    return (
+        "| Scenario | Convention | Status | Base PV | Shocked PV | Delta PV | "
+        "Largest contributor | Contributor delta | Largest loser | Loser delta |\n"
+        "|---|---|---|---:|---:|---:|---|---:|---|---:|\n"
+        + body
+    )
+
+
+def _format_scenario_compare_grouped_table(grouped: dict) -> str:
+    scenario_names = list(grouped.keys())
+    group_names = sorted(
+        {
+            group
+            for scenario_values in grouped.values()
+            for group in (scenario_values or {}).keys()
+        }
+    )
+    header = "| Group | " + " | ".join(scenario_names) + " |\n"
+    divider = "|---|" + "|".join("---:" for _ in scenario_names) + "|\n"
+    body = "".join(
+        "| "
+        + group
+        + " | "
+        + " | ".join(
+            f"{float((grouped.get(name, {}) or {}).get(group, 0.0) or 0.0):+,.2f}"
+            for name in scenario_names
+        )
+        + " |\n"
+        for group in group_names
+    )
+    return header + divider + body
+
+
+def _format_scenario_compare_position_table(data: dict) -> str:
+    scenario_names = [row.get("scenario_name", "") for row in data.get("scenarios", []) or []]
+    positions = data.get("positions", []) or []
+    header = "| Position ID | Instrument | Asset Class | " + " | ".join(scenario_names) + " |\n"
+    divider = "|---|---|---|" + "|".join("---:" for _ in scenario_names) + "|\n"
+    body = "".join(
+        "| "
+        + str(row.get("position_id", "-"))
+        + " | "
+        + str(row.get("instrument_type", "-"))
+        + " | "
+        + str(row.get("asset_class", "-"))
+        + " | "
+        + " | ".join(
+            f"{float((row.get('deltas_by_scenario', {}) or {}).get(name, 0.0) or 0.0):+,.2f}"
+            for name in scenario_names
+        )
+        + " |\n"
+        for row in positions
+    )
+    return header + divider + body
+
+
+def _format_scenario_compare_warning_table(data: dict) -> str:
+    scenario_rows = data.get("scenarios", []) or []
+    body = "".join(
+        f"| {row.get('scenario_name', '-')}"
+        f" | {len(row.get('warnings', []) or [])}"
+        f" | {'; '.join(row.get('warnings', []) or []) or 'None'} |\n"
+        for row in scenario_rows
+    )
+    return "| Scenario | Warning count | Detail |\n|---|---:|---|\n" + body
+
+
+def _format_value_contributor_table(rows: list[dict]) -> str:
+    body = "".join(
+        f"| {idx}"
+        f" | {row.get('position_id', 'â€”')}"
+        f" | {row.get('instrument_type', 'â€”')}"
+        f" | {row.get('asset_class', 'â€”')}"
+        f" | {float(row.get('pv', 0.0) or 0.0):,.2f} |\n"
+        for idx, row in enumerate(rows, start=1)
+    )
+    return "| Rank | Position ID | Instrument | Asset Class | PV |\n|---:|---|---|---|---:|\n" + body
+
+
+def _format_sensitivity_table(grouped: dict) -> str:
+    body = "".join(
+        f"| {group}"
+        f" | {float(values.get('rates_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(values.get('fx_spot_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(values.get('equity_spot_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(values.get('vol_sensitivity', 0.0) or 0.0):+,.2f} |\n"
+        for group, values in grouped.items()
+    )
+    return (
+        "| Group | Rates +1bp | FX spot +1% | Equity spot +1% | Vol +1pt |\n"
+        "|---|---:|---:|---:|---:|\n"
+        + body
+    )
+
+
+def _format_position_risk_table(rows: list[dict]) -> str:
+    body = "".join(
+        f"| {row.get('position_id', 'â€”')}"
+        f" | {row.get('instrument_type', 'â€”')}"
+        f" | {row.get('asset_class', 'â€”')}"
+        f" | {row.get('status', 'â€”')}"
+        f" | {float(row.get('base_pv', 0.0) or 0.0):,.2f}"
+        f" | {float(row.get('rates_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(row.get('fx_spot_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(row.get('equity_spot_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {float(row.get('vol_sensitivity', 0.0) or 0.0):+,.2f}"
+        f" | {'; '.join(row.get('warnings', []) or []) or 'â€”'} |\n"
+        for row in rows
+    )
+    return (
+        "| Position ID | Instrument | Asset Class | Status | Base PV | Rates +1bp | FX spot +1% | Equity spot +1% | Vol +1pt | Warnings |\n"
+        "|---|---|---|---|---:|---:|---:|---:|---:|---|\n"
+        + body
+    )
+
+
+def _format_risk_contributor_table(rows: list[dict], sensitivity_key: str) -> str:
+    body = "".join(
+        f"| {idx}"
+        f" | {row.get('position_id', 'â€”')}"
+        f" | {row.get('instrument_type', 'â€”')}"
+        f" | {row.get('asset_class', 'â€”')}"
+        f" | {float(row.get(sensitivity_key, 0.0) or 0.0):+,.2f} |\n"
+        for idx, row in enumerate(rows, start=1)
+    )
+    return "| Rank | Position ID | Instrument | Asset Class | Sensitivity |\n|---:|---|---|---|---:|\n" + body
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -261,6 +1261,62 @@ def call_scenario(
         body["curve_inputs"] = curve_inputs
     resp = requests.post(f"{BACKEND}/risk/scenario", json=body, timeout=10)
     return resp
+
+
+def call_portfolio_value(
+    portfolio_name: str,
+    valuation_date: str,
+    positions: list[dict],
+) -> requests.Response:
+    body = {
+        "portfolio_name": portfolio_name,
+        "valuation_date": valuation_date,
+        "positions": positions,
+    }
+    return requests.post(f"{BACKEND}/portfolio/value", json=body, timeout=10)
+
+
+def call_portfolio_scenario(
+    portfolio_name: str,
+    valuation_date: str,
+    positions: list[dict],
+    shocks: dict,
+) -> requests.Response:
+    body = {
+        "portfolio_name": portfolio_name,
+        "valuation_date": valuation_date,
+        "positions": positions,
+        "shocks": shocks,
+    }
+    return requests.post(f"{BACKEND}/portfolio/scenario", json=body, timeout=10)
+
+
+def call_portfolio_scenario_compare(
+    portfolio_name: str,
+    valuation_date: str,
+    positions: list[dict],
+    scenario_pack: str,
+) -> requests.Response:
+    body = {
+        "portfolio_name": portfolio_name,
+        "valuation_date": valuation_date,
+        "positions": positions,
+        "scenario_pack": scenario_pack,
+    }
+    return requests.post(f"{BACKEND}/portfolio/scenario-compare", json=body, timeout=15)
+
+
+def call_portfolio_risk(
+    portfolio_name: str,
+    valuation_date: str,
+    positions: list[dict],
+) -> requests.Response:
+    body = {
+        "portfolio_name": portfolio_name,
+        "valuation_date": valuation_date,
+        "positions": positions,
+    }
+    return requests.post(f"{BACKEND}/portfolio/risk", json=body, timeout=10)
 
 
 def call_bond(
@@ -743,6 +1799,7 @@ with st.sidebar:
         "Curve Builder",
         "Risk Ladder",
         "Scenario Analysis",
+        "Portfolio / Scenario",
         "Bond Pricing",
     ]
     _NAV_PLACEHOLDER = [
@@ -1922,6 +2979,677 @@ elif page == "Scenario Analysis":
                                             st.markdown(f"- {_a}")
                             else:
                                 _show_response_error("Scenario request failed", _sresp)
+
+
+# ===========================================================================
+# PAGE: Portfolio / Scenario
+# ===========================================================================
+
+elif page == "Portfolio / Scenario":
+    st.title("Portfolio / Scenario")
+    st.caption(
+        "Manual basket valuation and simple shocked revaluation across supported instruments."
+    )
+    st.caption(
+        "Contract: each position uses 'fields'; scenario payload uses 'shocks'. "
+        "Percent shock inputs are percentage points (e.g. 2.0 means +2%)."
+    )
+
+    _pcol1, _pcol2 = st.columns(2)
+    with _pcol1:
+        portfolio_name = st.text_input(
+            "Portfolio name",
+            value="Demo Portfolio",
+            key="portfolio_name",
+        )
+    with _pcol2:
+        portfolio_valuation_date = st.text_input(
+            "Valuation date (YYYY-MM-DD)",
+            value="2024-01-01",
+            key="portfolio_valuation_date",
+        )
+
+    st.markdown("### Position Input")
+    positions_input_mode = st.radio(
+        "Positions input mode",
+        options=["JSON", "CSV upload", "Pasted CSV/Table"],
+        horizontal=True,
+        key="portfolio_positions_input_mode",
+    )
+
+    positions_json_text = ""
+    uploaded_positions_file = None
+    pasted_positions_text = ""
+
+    if positions_input_mode == "JSON":
+        positions_json_text = st.text_area(
+            "Positions JSON (list)",
+            value=_DEFAULT_PORTFOLIO_POSITIONS_JSON,
+            height=320,
+            key="portfolio_positions_json",
+            help=(
+                "Each entry should include: position_id, instrument_type, quantity, "
+                "and fields (instrument-specific request fields)."
+            ),
+        )
+    elif positions_input_mode == "CSV upload":
+        uploaded_positions_file = st.file_uploader(
+            "Upload positions CSV/TSV",
+            type=["csv", "txt", "tsv"],
+            key="portfolio_positions_csv_upload",
+            help=(
+                "Include instrument_type, quantity, and instrument-specific field columns. "
+                "Use curve_inputs_json for optional curve inputs objects."
+            ),
+        )
+        st.caption(
+            "CSV headers should include position_id, instrument_type, quantity, optional asset_class, "
+            "plus instrument field columns such as expiry_date, spot_rate, strike_price, etc."
+        )
+    else:
+        pasted_positions_text = st.text_area(
+            "Paste CSV or tab-delimited table",
+            value=_DEFAULT_PORTFOLIO_CSV_TEXT,
+            height=240,
+            key="portfolio_positions_table_text",
+            help="Pasted table must include a header row with instrument_type.",
+        )
+
+    validate_positions_btn = st.button(
+        "Validate Position Input",
+        key="validate_portfolio_positions_btn",
+        use_container_width=True,
+    )
+
+    shocks_json_text = st.text_area(
+        "Scenario shocks JSON",
+        value=_DEFAULT_PORTFOLIO_SHOCKS_JSON,
+        height=120,
+        key="portfolio_shocks_json",
+        help=(
+            "Supported keys: rates_bps, fx_spot_pct, equity_spot_pct, vol_pct. "
+            "For pct keys, use percentage points (2.0 = +2%)."
+        ),
+    )
+
+    scenario_pack = st.selectbox(
+        "Scenario pack",
+        options=_SCENARIO_PACK_OPTIONS,
+        index=0,
+        key="portfolio_scenario_pack",
+    )
+    with st.expander("Scenario pack conventions", expanded=False):
+        convention_rows = "".join(
+            f"| {name} | {description} |\n"
+            for name, description in _SCENARIO_PACK_CONVENTIONS.items()
+        )
+        st.markdown("| Scenario | Convention |\n|---|---|\n" + convention_rows)
+
+    _pb1, _pb2, _pb3, _pb4 = st.columns(4)
+    with _pb1:
+        run_portfolio_value_btn = st.button(
+            "Value Portfolio",
+            type="primary",
+            key="run_portfolio_value_btn",
+            use_container_width=True,
+        )
+    with _pb2:
+        run_portfolio_scenario_btn = st.button(
+            "Run Portfolio Scenario",
+            key="run_portfolio_scenario_btn",
+            use_container_width=True,
+        )
+    with _pb3:
+        run_scenario_pack_btn = st.button(
+            "Run Scenario Pack",
+            key="run_scenario_pack_btn",
+            use_container_width=True,
+        )
+    with _pb4:
+        run_portfolio_risk_btn = st.button(
+            "Run Portfolio Risk",
+            key="run_portfolio_risk_btn",
+            use_container_width=True,
+        )
+
+    def _parse_positions_json(text: str) -> list[dict]:
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("Positions JSON must be a list of position objects.")
+        return parsed
+
+    def _parse_shocks_json(text: str) -> dict:
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Scenario shocks JSON must be an object.")
+        return parsed
+
+    def _resolve_positions_payload() -> tuple[list[dict], list[dict]]:
+        if positions_input_mode == "JSON":
+            parsed = _parse_positions_json(positions_json_text)
+            if not all(isinstance(row, dict) for row in parsed):
+                raise ValueError("Positions JSON entries must be objects.")
+            return _normalise_positions_and_collect_errors(parsed)
+
+        if positions_input_mode == "CSV upload":
+            if uploaded_positions_file is None:
+                raise ValueError("Upload a CSV/TSV file before validating or running.")
+            uploaded_text = uploaded_positions_file.getvalue().decode("utf-8-sig")
+            return _parse_delimited_positions_text(uploaded_text)
+
+        return _parse_delimited_positions_text(pasted_positions_text)
+
+    if validate_positions_btn:
+        try:
+            _preview_positions, _preview_errors = _resolve_positions_payload()
+        except Exception as exc:
+            _show_error("Position input parse error", str(exc))
+        else:
+            if _preview_errors:
+                st.error(
+                    f"Position input has {len(_preview_errors)} validation error(s)."
+                )
+                st.markdown(_format_portfolio_import_errors_md(_preview_errors))
+            else:
+                st.success(f"Validated {len(_preview_positions)} position(s).")
+                with st.expander("Normalized positions preview", expanded=False):
+                    st.json(_preview_positions)
+
+    if run_portfolio_value_btn:
+        if not portfolio_name.strip():
+            st.warning("Portfolio name is required.")
+        else:
+            try:
+                positions_payload, position_errors = _resolve_positions_payload()
+            except Exception as exc:
+                _show_error("Position input parse error", str(exc))
+                st.stop()
+
+            if position_errors:
+                st.error(
+                    f"Position input has {len(position_errors)} validation error(s). Fix rows below before valuation."
+                )
+                st.markdown(_format_portfolio_import_errors_md(position_errors))
+                st.stop()
+
+            st.subheader("Portfolio Value Result")
+            try:
+                pv_resp = call_portfolio_value(
+                    portfolio_name=portfolio_name.strip(),
+                    valuation_date=portfolio_valuation_date.strip(),
+                    positions=positions_payload,
+                )
+            except requests.exceptions.ConnectionError:
+                _show_error(
+                    "Backend unreachable",
+                    f"Cannot connect to {BACKEND}. Is the FastAPI server running?",
+                )
+            else:
+                if pv_resp.status_code == 200:
+                    pv_data = pv_resp.json()
+
+                    _pm1, _pm2, _pm3, _pm4 = st.columns(4)
+                    _pm1.metric("Status", pv_data.get("status", "—"))
+                    _pm2.metric("Positions", pv_data.get("position_count", 0))
+                    _pm3.metric("Valued", pv_data.get("valued_count", 0))
+                    _pm4.metric("Unsupported", pv_data.get("unsupported_count", 0))
+
+                    st.metric(
+                        "Total Portfolio PV",
+                        f"{pv_data.get('total_portfolio_pv', 0.0):,.2f}",
+                    )
+
+                    by_type = pv_data.get("grouped_pv_by_instrument_type", {})
+                    if by_type:
+                        st.markdown("**Grouped PV by instrument_type**")
+                        type_rows = "".join(
+                            f"| {k} | {v:,.2f} |\n" for k, v in by_type.items()
+                        )
+                        st.markdown("| Instrument | PV |\n|---|---:|\n" + type_rows)
+
+                    by_asset = pv_data.get("grouped_pv_by_asset_class", {})
+                    if by_asset:
+                        st.markdown("**Grouped PV by asset_class**")
+                        asset_rows = "".join(
+                            f"| {k} | {v:,.2f} |\n" for k, v in by_asset.items()
+                        )
+                        st.markdown("| Asset Class | PV |\n|---|---:|\n" + asset_rows)
+
+                    pos_rows = pv_data.get("positions", [])
+                    if pos_rows:
+                        st.markdown("**Position-level PV**")
+                        body_rows = "".join(
+                            f"| {r.get('position_id', '—')}"
+                            f" | {r.get('instrument_type', '—')}"
+                            f" | {r.get('asset_class', '—')}"
+                            f" | {r.get('quantity', 0.0)}"
+                            f" | {r.get('status', '—')}"
+                            f" | {r.get('pricing_status', '—')}"
+                            f" | {r.get('pv', 0.0):,.2f}"
+                            f" | {'; '.join(r.get('warnings', []) or []) or '—'} |\n"
+                            for r in pos_rows
+                        )
+                        st.markdown(
+                            "| Position ID | Instrument | Asset Class | Qty | Status | Pricing Status | PV | Warnings |\n"
+                            "|---|---|---|---:|---|---|---:|---|\n"
+                            + body_rows
+                        )
+
+                        ranked_base = _portfolio_ranked_rows(pos_rows, "pv", reverse=True, limit=5)
+                        if ranked_base:
+                            st.markdown("**Largest base PV positions**")
+                            st.markdown(_format_value_contributor_table(ranked_base))
+
+                    warning_summary = _portfolio_warning_summary(pv_data)
+                    st.markdown("**Warning summary**")
+                    st.markdown(_format_warning_summary_md(warning_summary))
+
+                    if pv_data.get("warnings"):
+                        for w in pv_data["warnings"]:
+                            st.warning(w)
+
+                    st.download_button(
+                        "Download Value JSON",
+                        data=json.dumps(pv_data, indent=2),
+                        file_name="portfolio_value_result.json",
+                        mime="application/json",
+                        key="download_portfolio_value_json",
+                    )
+
+                    st.download_button(
+                        "Download Value CSV Summary",
+                        data=_value_result_csv_summary(pv_data),
+                        file_name="portfolio_value_result.csv",
+                        mime="text/csv",
+                        key="download_portfolio_value_csv",
+                    )
+
+                    with st.expander("Raw response", expanded=False):
+                        st.json(pv_data)
+                else:
+                    _show_response_error("Portfolio value request failed", pv_resp)
+
+    if run_portfolio_scenario_btn:
+        if not portfolio_name.strip():
+            st.warning("Portfolio name is required.")
+        else:
+            try:
+                positions_payload, position_errors = _resolve_positions_payload()
+                shocks_payload = _parse_shocks_json(shocks_json_text)
+            except Exception as exc:
+                _show_error("Scenario input parse error", str(exc))
+                st.stop()
+
+            if position_errors:
+                st.error(
+                    f"Position input has {len(position_errors)} validation error(s). Fix rows below before scenario run."
+                )
+                st.markdown(_format_portfolio_import_errors_md(position_errors))
+                st.stop()
+
+            st.subheader("Portfolio Scenario Result")
+            try:
+                ps_resp = call_portfolio_scenario(
+                    portfolio_name=portfolio_name.strip(),
+                    valuation_date=portfolio_valuation_date.strip(),
+                    positions=positions_payload,
+                    shocks=shocks_payload,
+                )
+            except requests.exceptions.ConnectionError:
+                _show_error(
+                    "Backend unreachable",
+                    f"Cannot connect to {BACKEND}. Is the FastAPI server running?",
+                )
+            else:
+                if ps_resp.status_code == 200:
+                    ps_data = ps_resp.json()
+
+                    _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+                    _sm1.metric("Status", ps_data.get("status", "—"))
+                    _sm2.metric("Positions", ps_data.get("position_count", 0))
+                    _sm3.metric("Valued", ps_data.get("valued_count", 0))
+                    _sm4.metric("Unsupported", ps_data.get("unsupported_count", 0))
+
+                    _sm5, _sm6, _sm7 = st.columns(3)
+                    _sm5.metric("Base Portfolio PV", f"{ps_data.get('base_portfolio_pv', 0.0):,.2f}")
+                    _sm6.metric("Shocked Portfolio PV", f"{ps_data.get('shocked_portfolio_pv', 0.0):,.2f}")
+                    _sm7.metric("Delta vs Base", f"{ps_data.get('delta_portfolio_pv', 0.0):+,.2f}")
+
+                    delta_by_type = ps_data.get("grouped_delta_pv_by_instrument_type", {})
+                    if delta_by_type:
+                        st.markdown("**Delta PV by instrument_type**")
+                        delta_rows = "".join(
+                            f"| {k} | {v:+,.2f} |\n" for k, v in delta_by_type.items()
+                        )
+                        st.markdown("| Instrument | Delta PV |\n|---|---:|\n" + delta_rows)
+
+                    delta_by_asset = ps_data.get("grouped_delta_pv_by_asset_class", {})
+                    if delta_by_asset:
+                        st.markdown("**Grouped delta by asset class**")
+                        asset_delta_rows = "".join(
+                            f"| {k} | {v:+,.2f} |\n" for k, v in delta_by_asset.items()
+                        )
+                        st.markdown("| Asset Class | Delta PV |\n|---|---:|\n" + asset_delta_rows)
+
+                    pos_rows = ps_data.get("positions", [])
+                    if pos_rows:
+                        st.markdown("**Position-level scenario output**")
+                        body_rows = "".join(
+                            f"| {r.get('position_id', '—')}"
+                            f" | {r.get('instrument_type', '—')}"
+                            f" | {r.get('status', '—')}"
+                            f" | {r.get('base_pv', 0.0):,.2f}"
+                            f" | {r.get('shocked_pv', 0.0):,.2f}"
+                            f" | {r.get('delta_pv', 0.0):+,.2f}"
+                            f" | {'; '.join(r.get('warnings', []) or []) or '—'} |\n"
+                            for r in pos_rows
+                        )
+                        st.markdown(
+                            "| Position ID | Instrument | Status | Base PV | Shocked PV | Delta PV | Warnings |\n"
+                            "|---|---|---|---:|---:|---:|---|\n"
+                            + body_rows
+                        )
+
+                        positive_contributors = [
+                            row
+                            for row in _portfolio_ranked_rows(pos_rows, "delta_pv", reverse=True, limit=5)
+                            if float(row.get("delta_pv", 0.0) or 0.0) > 0.0
+                        ]
+                        st.markdown("**Largest positive contributors**")
+                        if positive_contributors:
+                            st.markdown(_format_scenario_contributor_table(positive_contributors))
+                        else:
+                            st.caption("No positive scenario contributors.")
+
+                        negative_contributors = [
+                            row
+                            for row in _portfolio_ranked_rows(pos_rows, "delta_pv", reverse=False, limit=5)
+                            if float(row.get("delta_pv", 0.0) or 0.0) < 0.0
+                        ]
+                        st.markdown("**Largest negative contributors**")
+                        if negative_contributors:
+                            st.markdown(_format_scenario_contributor_table(negative_contributors))
+                        else:
+                            st.caption("No negative scenario contributors.")
+
+                    warning_summary = _portfolio_warning_summary(ps_data)
+                    st.markdown("**Warning summary**")
+                    st.markdown(_format_warning_summary_md(warning_summary))
+
+                    interpretation_lines = _scenario_interpretation_lines(ps_data)
+                    st.markdown("**Scenario interpretation**")
+                    for line in interpretation_lines:
+                        st.markdown(f"- {line}")
+
+                    if ps_data.get("warnings"):
+                        for w in ps_data["warnings"]:
+                            st.warning(w)
+
+                    st.download_button(
+                        "Download Scenario JSON",
+                        data=json.dumps(ps_data, indent=2),
+                        file_name="portfolio_scenario_result.json",
+                        mime="application/json",
+                        key="download_portfolio_scenario_json",
+                    )
+
+                    st.download_button(
+                        "Download Scenario CSV Summary",
+                        data=_scenario_result_csv_summary(ps_data),
+                        file_name="portfolio_scenario_result.csv",
+                        mime="text/csv",
+                        key="download_portfolio_scenario_csv",
+                    )
+
+                    with st.expander("Raw response", expanded=False):
+                        st.json(ps_data)
+                else:
+                    _show_response_error("Portfolio scenario request failed", ps_resp)
+
+    if run_scenario_pack_btn:
+        if not portfolio_name.strip():
+            st.warning("Portfolio name is required.")
+        else:
+            try:
+                positions_payload, position_errors = _resolve_positions_payload()
+            except Exception as exc:
+                _show_error("Scenario pack input parse error", str(exc))
+                st.stop()
+
+            if position_errors:
+                st.error(
+                    f"Position input has {len(position_errors)} validation error(s). Fix rows below before scenario pack run."
+                )
+                st.markdown(_format_portfolio_import_errors_md(position_errors))
+                st.stop()
+
+            st.subheader("Multi-scenario Comparison")
+            try:
+                compare_resp = call_portfolio_scenario_compare(
+                    portfolio_name=portfolio_name.strip(),
+                    valuation_date=portfolio_valuation_date.strip(),
+                    positions=positions_payload,
+                    scenario_pack=scenario_pack,
+                )
+            except requests.exceptions.ConnectionError:
+                _show_error(
+                    "Backend unreachable",
+                    f"Cannot connect to {BACKEND}. Is the FastAPI server running?",
+                )
+            else:
+                if compare_resp.status_code == 200:
+                    compare_data = compare_resp.json()
+
+                    _cm1, _cm2, _cm3, _cm4 = st.columns(4)
+                    _cm1.metric("Status", compare_data.get("status", "-"))
+                    _cm2.metric("Scenario pack", compare_data.get("scenario_pack", "-"))
+                    _cm3.metric("Scenarios", compare_data.get("scenario_count", 0))
+                    _cm4.metric("Positions", compare_data.get("position_count", 0))
+
+                    conventions = compare_data.get("scenario_conventions", {}) or {}
+                    if conventions:
+                        st.markdown("**Scenario comparison conventions**")
+                        convention_rows = "".join(
+                            f"| {key} | {value} |\n" for key, value in conventions.items()
+                        )
+                        st.markdown("| Field | Convention |\n|---|---|\n" + convention_rows)
+
+                    scenario_rows = compare_data.get("scenarios", []) or []
+                    if scenario_rows:
+                        st.markdown("**Scenario summary table**")
+                        st.markdown(_format_scenario_compare_summary_table(scenario_rows))
+
+                    grouped_by_type = compare_data.get("grouped_delta_by_instrument_type", {}) or {}
+                    if grouped_by_type:
+                        st.markdown("**Grouped delta by instrument_type**")
+                        st.markdown(_format_scenario_compare_grouped_table(grouped_by_type))
+
+                    grouped_by_asset = compare_data.get("grouped_delta_by_asset_class", {}) or {}
+                    if grouped_by_asset:
+                        st.markdown("**Grouped delta by asset_class**")
+                        st.markdown(_format_scenario_compare_grouped_table(grouped_by_asset))
+
+                    position_rows = compare_data.get("positions", []) or []
+                    if position_rows:
+                        st.markdown("**Position comparison by scenario**")
+                        st.markdown(_format_scenario_compare_position_table(compare_data))
+
+                    st.markdown("**Scenario contributor comparison**")
+                    contributor_rows = "".join(
+                        f"| {row.get('scenario_name', '-')}"
+                        f" | {row.get('largest_contributor') or '-'}"
+                        f" | {float(row.get('largest_contributor_delta_pv', 0.0) or 0.0):+,.2f}"
+                        f" | {row.get('largest_loser') or '-'}"
+                        f" | {float(row.get('largest_loser_delta_pv', 0.0) or 0.0):+,.2f} |\n"
+                        for row in scenario_rows
+                    )
+                    st.markdown(
+                        "| Scenario | Largest contributor | Contributor delta | Largest loser | Loser delta |\n"
+                        "|---|---|---:|---|---:|\n"
+                        + contributor_rows
+                    )
+
+                    st.markdown("**Scenario comparison warnings**")
+                    st.markdown(_format_scenario_compare_warning_table(compare_data))
+
+                    if compare_data.get("warnings"):
+                        for w in compare_data["warnings"]:
+                            st.warning(w)
+
+                    st.download_button(
+                        "Download Scenario Comparison JSON",
+                        data=json.dumps(compare_data, indent=2),
+                        file_name="portfolio_scenario_comparison.json",
+                        mime="application/json",
+                        key="download_portfolio_scenario_compare_json",
+                    )
+
+                    st.download_button(
+                        "Download Scenario Comparison CSV Summary",
+                        data=_scenario_compare_csv_summary(compare_data),
+                        file_name="portfolio_scenario_comparison_summary.csv",
+                        mime="text/csv",
+                        key="download_portfolio_scenario_compare_csv",
+                    )
+
+                    st.download_button(
+                        "Download Scenario Position Comparison CSV",
+                        data=_scenario_compare_position_csv(compare_data),
+                        file_name="portfolio_scenario_position_comparison.csv",
+                        mime="text/csv",
+                        key="download_portfolio_scenario_compare_positions_csv",
+                    )
+
+                    with st.expander("Raw scenario comparison response", expanded=False):
+                        st.json(compare_data)
+                else:
+                    _show_response_error("Scenario comparison request failed", compare_resp)
+
+    if run_portfolio_risk_btn:
+        if not portfolio_name.strip():
+            st.warning("Portfolio name is required.")
+        else:
+            try:
+                positions_payload, position_errors = _resolve_positions_payload()
+            except Exception as exc:
+                _show_error("Risk input parse error", str(exc))
+                st.stop()
+
+            if position_errors:
+                st.error(
+                    f"Position input has {len(position_errors)} validation error(s). Fix rows below before risk run."
+                )
+                st.markdown(_format_portfolio_import_errors_md(position_errors))
+                st.stop()
+
+            st.subheader("Portfolio Risk Decomposition")
+            try:
+                risk_resp = call_portfolio_risk(
+                    portfolio_name=portfolio_name.strip(),
+                    valuation_date=portfolio_valuation_date.strip(),
+                    positions=positions_payload,
+                )
+            except requests.exceptions.ConnectionError:
+                _show_error(
+                    "Backend unreachable",
+                    f"Cannot connect to {BACKEND}. Is the FastAPI server running?",
+                )
+            else:
+                if risk_resp.status_code == 200:
+                    risk_data = risk_resp.json()
+
+                    _rm1, _rm2, _rm3, _rm4 = st.columns(4)
+                    _rm1.metric("Status", risk_data.get("status", "â€”"))
+                    _rm2.metric("Positions", risk_data.get("position_count", 0))
+                    _rm3.metric("Valued", risk_data.get("valued_count", 0))
+                    _rm4.metric("Unsupported", risk_data.get("unsupported_count", 0))
+
+                    st.metric(
+                        "Total Portfolio PV",
+                        f"{risk_data.get('total_portfolio_pv', 0.0):,.2f}",
+                    )
+
+                    totals = risk_data.get("total_sensitivities", {}) or {}
+                    _rs1, _rs2, _rs3, _rs4 = st.columns(4)
+                    _rs1.metric("Rates sensitivity (+1bp)", f"{totals.get('rates_sensitivity', 0.0):+,.2f}")
+                    _rs2.metric("FX spot sensitivity (+1%)", f"{totals.get('fx_spot_sensitivity', 0.0):+,.2f}")
+                    _rs3.metric("Equity spot sensitivity (+1%)", f"{totals.get('equity_spot_sensitivity', 0.0):+,.2f}")
+                    _rs4.metric("Vol sensitivity (+1pt)", f"{totals.get('vol_sensitivity', 0.0):+,.2f}")
+
+                    conventions = risk_data.get("sensitivity_conventions", {}) or {}
+                    if conventions:
+                        st.markdown("**Sensitivity conventions**")
+                        convention_rows = "".join(
+                            f"| {key} | {value} |\n" for key, value in conventions.items()
+                        )
+                        st.markdown("| Sensitivity | Convention |\n|---|---|\n" + convention_rows)
+
+                    by_type = risk_data.get("grouped_sensitivities_by_instrument_type", {}) or {}
+                    if by_type:
+                        st.markdown("**Grouped sensitivities by instrument_type**")
+                        st.markdown(_format_sensitivity_table(by_type))
+
+                    by_asset = risk_data.get("grouped_sensitivities_by_asset_class", {}) or {}
+                    if by_asset:
+                        st.markdown("**Grouped sensitivities by asset_class**")
+                        st.markdown(_format_sensitivity_table(by_asset))
+
+                    pos_rows = risk_data.get("positions", []) or []
+                    if pos_rows:
+                        st.markdown("**Position-level sensitivities**")
+                        st.markdown(_format_position_risk_table(pos_rows))
+
+                        for key, label in [
+                            ("rates_sensitivity", "rates sensitivity"),
+                            ("fx_spot_sensitivity", "fx spot sensitivity"),
+                            ("equity_spot_sensitivity", "equity spot sensitivity"),
+                            ("vol_sensitivity", "vol sensitivity"),
+                        ]:
+                            positive = [
+                                row
+                                for row in _portfolio_ranked_rows(pos_rows, key, reverse=True, limit=3)
+                                if float(row.get(key, 0.0) or 0.0) > 0.0
+                            ]
+                            negative = [
+                                row
+                                for row in _portfolio_ranked_rows(pos_rows, key, reverse=False, limit=3)
+                                if float(row.get(key, 0.0) or 0.0) < 0.0
+                            ]
+                            if positive:
+                                st.markdown(f"**Largest positive {label} contributors**")
+                                st.markdown(_format_risk_contributor_table(positive, key))
+                            if negative:
+                                st.markdown(f"**Largest negative {label} contributors**")
+                                st.markdown(_format_risk_contributor_table(negative, key))
+
+                    warning_summary = _portfolio_warning_summary(risk_data)
+                    st.markdown("**Risk warning summary**")
+                    st.markdown(_format_warning_summary_md(warning_summary))
+
+                    if risk_data.get("warnings"):
+                        for w in risk_data["warnings"]:
+                            st.warning(w)
+
+                    st.download_button(
+                        "Download Risk JSON",
+                        data=json.dumps(risk_data, indent=2),
+                        file_name="portfolio_risk_result.json",
+                        mime="application/json",
+                        key="download_portfolio_risk_json",
+                    )
+
+                    st.download_button(
+                        "Download Risk CSV Summary",
+                        data=_risk_result_csv_summary(risk_data),
+                        file_name="portfolio_risk_result.csv",
+                        mime="text/csv",
+                        key="download_portfolio_risk_csv",
+                    )
+
+                    with st.expander("Raw risk response", expanded=False):
+                        st.json(risk_data)
+                else:
+                    _show_response_error("Portfolio risk request failed", risk_resp)
 
 
 # ===========================================================================
