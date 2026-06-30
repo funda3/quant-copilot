@@ -1,7 +1,7 @@
 
 # Quant Copilot — Streamlit Workbench
 
-Sidebar-navigation workbench for ZAR IRS pricing, risk analytics, fixed-rate bond pricing, deterministic FX forward pricing, deterministic FX swap pricing, European FX option pricing, and European equity option pricing.
+Sidebar-navigation workbench for ZAR IRS pricing, risk analytics, fixed-rate bond pricing, deterministic FX forward pricing, deterministic FX swap pricing, European FX option pricing, European equity option pricing, and a dedicated Portfolio / Scenario basket workflow.
 Connects to the local FastAPI backend at `http://127.0.0.1:8001` for local live testing in this workspace.
 
 ---
@@ -71,6 +71,30 @@ result block and key output fields.
 cd streamlit-app
 .venv\Scripts\python.exe -m unittest tests.test_fra_smoke -v
 ```
+
+## Run the Portfolio / Scenario smoke test
+
+This smoke test exercises the dedicated Portfolio / Scenario page with mocked
+backend responses. It verifies that the page is reachable from navigation,
+supports JSON and pasted-table import flows, blocks malformed rows before
+backend calls, posts to `POST /portfolio/value`, `POST /portfolio/scenario`,
+and `POST /portfolio/risk`, and renders base/shocked/risk portfolio output
+blocks with JSON and CSV export controls.
+
+```bash
+cd streamlit-app
+.venv\Scripts\python.exe -m unittest tests.test_portfolio_scenario_smoke -v
+```
+
+## Portfolio / Scenario import-export quick guide
+
+- Position input mode supports `JSON`, `CSV upload`, and `Pasted CSV/Table`.
+- Validation is row-level and runs before backend pricing calls. Errors are
+    shown as a table with row number, position id, instrument type, and message.
+- CSV or pasted tables must include `instrument_type` in the header and should
+    provide instrument-specific columns that map to backend `fields`.
+- Successful runs expose both JSON and CSV summary downloads for Value and
+    Scenario outputs.
 
 ## Run the FX forward smoke test
 
@@ -281,9 +305,9 @@ cd streamlit-app
 
 ## Navigation
 
-The left sidebar contains a radio selector with the nine implemented pages.
+The left sidebar contains a radio selector with the eleven implemented pages.
 Selecting a page replaces the main panel content — only controls relevant to
-that workflow are shown.  Below the implemented pages the sidebar lists four
+that workflow are shown.  Below the implemented pages the sidebar lists two
 future placeholders (not yet implemented).
 
 ### Implemented pages
@@ -295,16 +319,17 @@ future placeholders (not yet implemented).
 | **FX Forward Pricing** | ✅ Implemented | `POST /price/fx-forward` |
 | **FX Swap Pricing** | ✅ Implemented | `POST /price/fx-swap` |
 | **European FX Option** | ✅ Implemented | `POST /price/fx-option` |
+| **European Equity Option** | ✅ Implemented | `POST /price/equity-option` |
 | **Curve Builder** | ✅ Implemented | `POST /api/curve` |
 | **Risk Ladder** | ✅ Implemented | `POST /quote` → `POST /risk/ladder` |
 | **Scenario Analysis** | ✅ Implemented | `POST /quote` → `POST /risk/scenario` |
+| **Portfolio / Scenario** | ✅ Implemented | `POST /portfolio/value`, `POST /portfolio/scenario`, `POST /portfolio/risk`, `POST /portfolio/scenario-compare` |
 | **Bond Pricing** | ✅ Implemented | `POST /price/bond`, `POST /risk/bond`, `POST /price/bond/ytm` |
 
 ### Planned pages (sidebar placeholders only)
 
 | Page | Status |
 |---|---|
-| Black-Scholes Options | Coming soon |
 | Greeks | Coming soon |
 | Monte Carlo Lab | Coming soon |
 
@@ -677,6 +702,54 @@ Results show:
 
 ---
 
+### Portfolio / Scenario
+
+Dedicated basket workflow for base valuation, shocked revaluation,
+multi-scenario comparison, and finite-difference risk decomposition.
+
+Contract notes for manual JSON entry:
+- Position entries use `fields` for instrument-specific request fields.
+- Scenario requests use `shocks` (not `scenario`).
+- Route paths are `POST /portfolio/value`, `POST /portfolio/scenario`,
+  `POST /portfolio/risk`, and `POST /portfolio/scenario-compare`.
+
+1. Enter **Portfolio name** and **Valuation date**.
+2. Edit **Positions JSON (list)** as needed.
+3. Click **Value Portfolio** for base valuation.
+4. Edit **Scenario shocks JSON** and click **Run Portfolio Scenario** for shocked results.
+5. Choose **Scenario pack** and click **Run Scenario Pack** for side-by-side
+   multi-scenario comparison.
+6. Click **Run Portfolio Risk** for first-order portfolio sensitivities.
+
+Results show:
+- Position-level base/shocked PV with warnings
+- Total portfolio PV and shocked total
+- Delta vs base at position and portfolio level
+- Grouped totals by instrument type and asset class
+- Grouped delta by asset class for scenario runs
+- Largest positive contributors and largest negative contributors by position
+- A warning summary for ignored shocks, unsupported rows, and valuation warnings
+- Grounded scenario interpretation derived from returned contribution and warning data
+- Scenario pack comparison with summary, grouped delta by instrument type and
+  asset class, position deltas by scenario, contributor/loser rows, warnings,
+  and JSON/CSV exports
+- Portfolio risk decomposition with rates, FX spot, equity spot, and volatility sensitivities
+- Grouped sensitivities by instrument type and asset class
+- Position-level sensitivities and largest risk contributors by dimension
+
+Default scenario pack:
+- `Core Market Moves`: Rates Up/Down (+/-100bp), FX Up/Down (+/-5%), Equity
+  Up/Down (+/-5%), Vol Up (+5%), and Combined Stress (rates +100bp, FX +5%,
+  equity -5%, vol +5%).
+
+Risk sensitivity conventions:
+- `rates_sensitivity`: PV change for a parallel +1bp rate move.
+- `fx_spot_sensitivity`: PV change for a +1% FX spot move.
+- `equity_spot_sensitivity`: PV change for a +1% equity spot move.
+- `vol_sensitivity`: PV change for a +1 vol point move (`volatility + 0.01`).
+
+---
+
 ### Bond Pricing
 
 DCF pricing, risk, and YTM solving for a plain fixed-rate bond. All three
@@ -744,6 +817,10 @@ Results show:
 | **Build Curve** | `POST /api/curve` | Bootstrap discount curve from market inputs |
 | **Run Ladder** | `POST /quote` → `POST /risk/ladder` | Bucketed PV01 ladder for IRS |
 | **Run Scenarios** | `POST /quote` → `POST /risk/scenario` | Parallel curve-shift scenario NPV table |
+| **Value Portfolio** | `POST /portfolio/value` | Base basket valuation with position-level PV and grouped totals |
+| **Run Portfolio Scenario** | `POST /portfolio/scenario` | Shocked basket valuation and delta-to-base report |
+| **Run Scenario Pack** | `POST /portfolio/scenario-compare` | Predefined multi-scenario comparison with grouped and position deltas |
+| **Run Portfolio Risk** | `POST /portfolio/risk` | Finite-difference portfolio sensitivities by position, instrument type, and asset class |
 | **Price Bond** | `POST /price/bond` | Fixed-rate bond: clean price, dirty price, accrued interest |
 | **Run Bond Risk** | `POST /risk/bond` | Fixed-rate bond: DV01, modified duration, Macaulay duration, and convexity |
 | **Solve YTM** | `POST /price/bond/ytm` | Flat annual yield-to-maturity from observed dirty price |
