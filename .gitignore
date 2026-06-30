@@ -27,6 +27,5 @@ npm-debug.log*
 Thumbs.db
 
 # Project-specific
-*.txt
 *.bak
 *.log
