@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import assumptions, curve, extract, health, price, quote, risk
+from app.api import assumptions, curve, extract, health, portfolio, price, quote, risk
 
 app = FastAPI(
     title="Quant Copilot API",
@@ -23,6 +23,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(extract.router)
 app.include_router(price.router)
+app.include_router(portfolio.router)
 app.include_router(quote.router)
 app.include_router(assumptions.router)
 app.include_router(curve.router, prefix="/api")
